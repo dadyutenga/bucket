@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+  <style>
+    text { font-family: 'DejaVu Sans', Arial, sans-serif; font-size: 16px; fill: #111827; }
+    rect { fill: #fef3c7; stroke: #b45309; stroke-width: 2; rx: 8; ry: 8; }
+    path { stroke: #b45309; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="10" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b45309" />
+    </marker>
+  </defs>
+  <rect x="80" y="60" width="200" height="100" />
+  <text x="180" y="105" text-anchor="middle">PUT Object</text>
+  <text x="180" y="130" text-anchor="middle">(Client)</text>
+
+  <rect x="360" y="60" width="220" height="100" />
+  <text x="470" y="105" text-anchor="middle">Ingest Pipeline</text>
+  <text x="470" y="130" text-anchor="middle">Chunk &amp; RS Encode</text>
+
+  <rect x="680" y="60" width="200" height="100" />
+  <text x="780" y="105" text-anchor="middle">Placement Router</text>
+  <text x="780" y="130" text-anchor="middle">Consistent Hash</text>
+
+  <rect x="200" y="240" width="220" height="100" />
+  <text x="310" y="285" text-anchor="middle">Metadata Txn</text>
+  <text x="310" y="310" text-anchor="middle">Postgres</text>
+
+  <rect x="520" y="240" width="360" height="160" />
+  <text x="700" y="285" text-anchor="middle">Shard Writes</text>
+  <text x="700" y="310" text-anchor="middle">Storage Nodes k+m</text>
+  <text x="700" y="335" text-anchor="middle">Quorum ACK ≥ k</text>
+
+  <path d="M280 110 L360 110" />
+  <path d="M580 110 L680 110" />
+  <path d="M470 160 L470 240" />
+  <path d="M680 160 L680 260" />
+  <path d="M420 290 L520 290" />
+  <path d="M780 340 L780 400" />
+  <rect x="720" y="400" width="220" height="80" />
+  <text x="830" y="440" text-anchor="middle">Client ACK</text>
+  <text x="830" y="465" text-anchor="middle">ETag + Metadata</text>
+  <path d="M780 400 L830 400" />
+</svg>
