@@ -2527,3 +2527,3213 @@ return newKey, secret, nil
 }
 ```
 
+
+## File: pkg/auth/policy.go
+
+```go
+// path: pkg/auth/policy.go
+package auth
+
+import (
+"context"
+"encoding/json"
+"fmt"
+"net"
+"regexp"
+"strings"
+
+"github.com/dadyutenga/bucket/pkg/utils"
+)
+
+// Effect represents the effect of a policy statement
+type Effect string
+
+const (
+EffectAllow Effect = "Allow"
+EffectDeny  Effect = "Deny"
+)
+
+// PolicyStatement represents a single IAM-style policy statement
+type PolicyStatement struct {
+Sid          string                 `json:"Sid,omitempty"`
+Effect       Effect                 `json:"Effect"`
+Principal    map[string]interface{} `json:"Principal,omitempty"`
+NotPrincipal map[string]interface{} `json:"NotPrincipal,omitempty"`
+Action       interface{}            `json:"Action"` // string or []string
+NotAction    interface{}            `json:"NotAction,omitempty"`
+Resource     interface{}            `json:"Resource"` // string or []string
+NotResource  interface{}            `json:"NotResource,omitempty"`
+Condition    map[string]map[string]interface{} `json:"Condition,omitempty"`
+}
+
+// Policy represents a bucket policy
+type Policy struct {
+Version    string             `json:"Version"`
+ID         string             `json:"Id,omitempty"`
+Statements []*PolicyStatement `json:"Statement"`
+}
+
+// EvaluationContext contains context for policy evaluation
+type EvaluationContext struct {
+Principal    string
+Action       string
+Resource     string
+SourceIP     string
+Referer      string
+UserAgent    string
+SecureTransport bool
+CurrentTime  string
+Epoch        int64
+CustomValues map[string]string
+}
+
+// PolicyEvaluator evaluates IAM-style policies
+type PolicyEvaluator struct {
+}
+
+// NewPolicyEvaluator creates a new policy evaluator
+func NewPolicyEvaluator() *PolicyEvaluator {
+return &PolicyEvaluator{}
+}
+
+// Evaluate evaluates a policy against an evaluation context
+func (pe *PolicyEvaluator) Evaluate(ctx context.Context, policy *Policy, evalCtx *EvaluationContext) (bool, error) {
+// Default is deny
+explicitAllow := false
+explicitDeny := false
+
+// Evaluate each statement
+for _, stmt := range policy.Statements {
+// Check if statement applies to this context
+applies, err := pe.statementApplies(stmt, evalCtx)
+if err != nil {
+return false, fmt.Errorf("failed to evaluate statement: %w", err)
+}
+
+if !applies {
+continue
+}
+
+// Check effect
+if stmt.Effect == EffectAllow {
+explicitAllow = true
+} else if stmt.Effect == EffectDeny {
+explicitDeny = true
+}
+}
+
+// Explicit deny always wins
+if explicitDeny {
+return false, nil
+}
+
+return explicitAllow, nil
+}
+
+// statementApplies checks if a statement applies to the evaluation context
+func (pe *PolicyEvaluator) statementApplies(stmt *PolicyStatement, evalCtx *EvaluationContext) (bool, error) {
+// Check principal
+if !pe.matchPrincipal(stmt.Principal, stmt.NotPrincipal, evalCtx.Principal) {
+return false, nil
+}
+
+// Check action
+if !pe.matchValue(stmt.Action, stmt.NotAction, evalCtx.Action) {
+return false, nil
+}
+
+// Check resource
+if !pe.matchValue(stmt.Resource, stmt.NotResource, evalCtx.Resource) {
+return false, nil
+}
+
+// Check conditions
+if stmt.Condition != nil {
+matches, err := pe.evaluateConditions(stmt.Condition, evalCtx)
+if err != nil {
+return false, err
+}
+if !matches {
+return false, nil
+}
+}
+
+return true, nil
+}
+
+// matchPrincipal checks if principal matches
+func (pe *PolicyEvaluator) matchPrincipal(principal, notPrincipal map[string]interface{}, value string) bool {
+// If no principal is specified, it applies to all
+if principal == nil && notPrincipal == nil {
+return true
+}
+
+// Check NotPrincipal first
+if notPrincipal != nil {
+if pe.matchPrincipalValue(notPrincipal, value) {
+return false
+}
+return true
+}
+
+// Check Principal
+if principal != nil {
+// Special case: "*" means everyone
+if star, ok := principal["*"]; ok && star == "*" {
+return true
+}
+return pe.matchPrincipalValue(principal, value)
+}
+
+return false
+}
+
+// matchPrincipalValue checks if a principal value matches
+func (pe *PolicyEvaluator) matchPrincipalValue(principalMap map[string]interface{}, value string) bool {
+for key, val := range principalMap {
+switch v := val.(type) {
+case string:
+if pe.matchPattern(v, value) {
+return true
+}
+case []interface{}:
+for _, item := range v {
+if str, ok := item.(string); ok {
+if pe.matchPattern(str, value) {
+return true
+}
+}
+}
+}
+}
+return false
+}
+
+// matchValue checks if action or resource matches
+func (pe *PolicyEvaluator) matchValue(positive, negative interface{}, value string) bool {
+// Check NotAction/NotResource first
+if negative != nil {
+if pe.matchValueInternal(negative, value) {
+return false
+}
+return true
+}
+
+// Check Action/Resource
+if positive != nil {
+return pe.matchValueInternal(positive, value)
+}
+
+return false
+}
+
+// matchValueInternal performs the actual matching
+func (pe *PolicyEvaluator) matchValueInternal(pattern interface{}, value string) bool {
+switch p := pattern.(type) {
+case string:
+return pe.matchPattern(p, value)
+case []interface{}:
+for _, item := range p {
+if str, ok := item.(string); ok {
+if pe.matchPattern(str, value) {
+return true
+}
+}
+}
+case []string:
+for _, str := range p {
+if pe.matchPattern(str, value) {
+return true
+}
+}
+}
+return false
+}
+
+// matchPattern matches a pattern with wildcards
+func (pe *PolicyEvaluator) matchPattern(pattern, value string) bool {
+// Convert wildcard pattern to regex
+// * matches any sequence of characters
+// ? matches any single character
+pattern = regexp.QuoteMeta(pattern)
+pattern = strings.ReplaceAll(pattern, "\\*", ".*")
+pattern = strings.ReplaceAll(pattern, "\\?", ".")
+pattern = "^" + pattern + "$"
+
+matched, _ := regexp.MatchString(pattern, value)
+return matched
+}
+
+// evaluateConditions evaluates policy conditions
+func (pe *PolicyEvaluator) evaluateConditions(conditions map[string]map[string]interface{}, evalCtx *EvaluationContext) (bool, error) {
+for operator, values := range conditions {
+for key, value := range values {
+matches, err := pe.evaluateCondition(operator, key, value, evalCtx)
+if err != nil {
+return false, err
+}
+if !matches {
+return false, nil
+}
+}
+}
+return true, nil
+}
+
+// evaluateCondition evaluates a single condition
+func (pe *PolicyEvaluator) evaluateCondition(operator, key string, value interface{}, evalCtx *EvaluationContext) (bool, error) {
+// Get the actual value from context
+contextValue := pe.getContextValue(key, evalCtx)
+
+switch operator {
+case "StringEquals":
+return pe.stringEquals(contextValue, value), nil
+case "StringNotEquals":
+return !pe.stringEquals(contextValue, value), nil
+case "StringLike":
+return pe.stringLike(contextValue, value), nil
+case "StringNotLike":
+return !pe.stringLike(contextValue, value), nil
+case "IpAddress":
+return pe.ipAddress(contextValue, value), nil
+case "NotIpAddress":
+return !pe.ipAddress(contextValue, value), nil
+case "Bool":
+return pe.boolCondition(contextValue, value), nil
+case "Null":
+return pe.nullCondition(contextValue, value), nil
+default:
+return false, fmt.Errorf("unsupported condition operator: %s", operator)
+}
+}
+
+// getContextValue retrieves a value from the evaluation context
+func (pe *PolicyEvaluator) getContextValue(key string, evalCtx *EvaluationContext) string {
+switch key {
+case "aws:SourceIp":
+return evalCtx.SourceIP
+case "aws:Referer":
+return evalCtx.Referer
+case "aws:UserAgent":
+return evalCtx.UserAgent
+case "aws:SecureTransport":
+if evalCtx.SecureTransport {
+return "true"
+}
+return "false"
+case "aws:CurrentTime":
+return evalCtx.CurrentTime
+case "aws:EpochTime":
+return fmt.Sprintf("%d", evalCtx.Epoch)
+default:
+// Check custom values
+if evalCtx.CustomValues != nil {
+return evalCtx.CustomValues[key]
+}
+return ""
+}
+}
+
+// stringEquals checks string equality
+func (pe *PolicyEvaluator) stringEquals(contextValue string, value interface{}) bool {
+switch v := value.(type) {
+case string:
+return contextValue == v
+case []interface{}:
+for _, item := range v {
+if str, ok := item.(string); ok && contextValue == str {
+return true
+}
+}
+case []string:
+for _, str := range v {
+if contextValue == str {
+return true
+}
+}
+}
+return false
+}
+
+// stringLike checks string pattern matching
+func (pe *PolicyEvaluator) stringLike(contextValue string, value interface{}) bool {
+switch v := value.(type) {
+case string:
+return pe.matchPattern(v, contextValue)
+case []interface{}:
+for _, item := range v {
+if str, ok := item.(string); ok && pe.matchPattern(str, contextValue) {
+return true
+}
+}
+case []string:
+for _, str := range v {
+if pe.matchPattern(str, contextValue) {
+return true
+}
+}
+}
+return false
+}
+
+// ipAddress checks if IP address matches CIDR
+func (pe *PolicyEvaluator) ipAddress(contextValue string, value interface{}) bool {
+ip := net.ParseIP(contextValue)
+if ip == nil {
+return false
+}
+
+switch v := value.(type) {
+case string:
+return pe.ipMatchesCIDR(ip, v)
+case []interface{}:
+for _, item := range v {
+if str, ok := item.(string); ok && pe.ipMatchesCIDR(ip, str) {
+return true
+}
+}
+case []string:
+for _, str := range v {
+if pe.ipMatchesCIDR(ip, str) {
+return true
+}
+}
+}
+return false
+}
+
+// ipMatchesCIDR checks if an IP matches a CIDR range
+func (pe *PolicyEvaluator) ipMatchesCIDR(ip net.IP, cidr string) bool {
+_, ipNet, err := net.ParseCIDR(cidr)
+if err != nil {
+// Try as single IP
+if ip.Equal(net.ParseIP(cidr)) {
+return true
+}
+return false
+}
+return ipNet.Contains(ip)
+}
+
+// boolCondition evaluates a boolean condition
+func (pe *PolicyEvaluator) boolCondition(contextValue string, value interface{}) bool {
+expectedBool := false
+switch v := value.(type) {
+case bool:
+expectedBool = v
+case string:
+expectedBool = v == "true"
+}
+
+contextBool := contextValue == "true"
+return contextBool == expectedBool
+}
+
+// nullCondition evaluates a null condition
+func (pe *PolicyEvaluator) nullCondition(contextValue string, value interface{}) bool {
+expectedNull := false
+switch v := value.(type) {
+case bool:
+expectedNull = v
+case string:
+expectedNull = v == "true"
+}
+
+contextNull := contextValue == ""
+return contextNull == expectedNull
+}
+
+// ParsePolicy parses a JSON policy
+func ParsePolicy(data []byte) (*Policy, error) {
+var policy Policy
+if err := json.Unmarshal(data, &policy); err != nil {
+return nil, fmt.Errorf("failed to parse policy: %w", err)
+}
+
+// Validate policy
+if err := validatePolicy(&policy); err != nil {
+return nil, fmt.Errorf("invalid policy: %w", err)
+}
+
+return &policy, nil
+}
+
+// validatePolicy validates a policy
+func validatePolicy(policy *Policy) error {
+if policy.Version == "" {
+policy.Version = "2012-10-17"
+}
+
+if len(policy.Statements) == 0 {
+return fmt.Errorf("policy must have at least one statement")
+}
+
+for i, stmt := range policy.Statements {
+if stmt.Effect != EffectAllow && stmt.Effect != EffectDeny {
+return fmt.Errorf("statement %d: invalid effect %s", i, stmt.Effect)
+}
+
+if stmt.Action == nil && stmt.NotAction == nil {
+return fmt.Errorf("statement %d: must specify Action or NotAction", i)
+}
+
+if stmt.Resource == nil && stmt.NotResource == nil {
+return fmt.Errorf("statement %d: must specify Resource or NotResource", i)
+}
+}
+
+return nil
+}
+
+// DefaultBucketPolicy creates a default bucket policy that allows owner full access
+func DefaultBucketPolicy(bucketName, ownerID string) *Policy {
+return &Policy{
+Version: "2012-10-17",
+Statements: []*PolicyStatement{
+{
+Sid:    "OwnerFullAccess",
+Effect: EffectAllow,
+Principal: map[string]interface{}{
+"AWS": ownerID,
+},
+Action: []string{
+"s3:*",
+},
+Resource: []string{
+fmt.Sprintf("arn:aws:s3:::%s", bucketName),
+fmt.Sprintf("arn:aws:s3:::%s/*", bucketName),
+},
+},
+},
+}
+}
+
+// PublicReadPolicy creates a policy that allows public read access
+func PublicReadPolicy(bucketName string) *Policy {
+return &Policy{
+Version: "2012-10-17",
+Statements: []*PolicyStatement{
+{
+Sid:    "PublicReadGetObject",
+Effect: EffectAllow,
+Principal: map[string]interface{}{
+"*": "*",
+},
+Action: []string{
+"s3:GetObject",
+},
+Resource: []string{
+fmt.Sprintf("arn:aws:s3:::%s/*", bucketName),
+},
+},
+},
+}
+}
+```
+
+---
+
+# PART 4: Erasure Coding & Data Plane
+
+## File: pkg/ec/ec.go
+
+```go
+// path: pkg/ec/ec.go
+package ec
+
+import (
+"context"
+"fmt"
+"io"
+)
+
+// Encoder encodes data using erasure coding
+type Encoder interface {
+// Encode encodes data into shards
+Encode(data []byte) ([][]byte, error)
+
+// EncodeStream encodes data from a reader into shards
+EncodeStream(ctx context.Context, r io.Reader, blockSize int) ([][]byte, error)
+
+// DataShards returns the number of data shards
+DataShards() int
+
+// ParityShards returns the number of parity shards
+ParityShards() int
+
+// TotalShards returns the total number of shards
+TotalShards() int
+}
+
+// Decoder decodes data using erasure coding
+type Decoder interface {
+// Decode reconstructs data from shards
+Decode(shards [][]byte) ([]byte, error)
+
+// Reconstruct reconstructs missing shards
+Reconstruct(shards [][]byte) error
+
+// Verify verifies the integrity of shards
+Verify(shards [][]byte) (bool, error)
+
+// DataShards returns the number of data shards
+DataShards() int
+
+// ParityShards returns the number of parity shards
+ParityShards() int
+
+// TotalShards returns the total number of shards
+TotalShards() int
+}
+
+// Codec provides both encoding and decoding capabilities
+type Codec interface {
+Encoder
+Decoder
+}
+
+// Config represents erasure coding configuration
+type Config struct {
+DataShards   int
+ParityShards int
+BlockSize    int
+}
+
+// Validate validates the configuration
+func (c *Config) Validate() error {
+if c.DataShards < 1 {
+return fmt.Errorf("data shards must be at least 1")
+}
+if c.ParityShards < 1 {
+return fmt.Errorf("parity shards must be at least 1")
+}
+if c.BlockSize < 1024 {
+return fmt.Errorf("block size must be at least 1024 bytes")
+}
+return nil
+}
+
+// ShardInfo represents information about a shard
+type ShardInfo struct {
+Index    int
+Data     []byte
+Size     int64
+Checksum uint32
+NodeID   string
+Location string
+}
+
+// ShardSet represents a set of shards for an object
+type ShardSet struct {
+ObjectID     string
+Version      string
+Shards       []*ShardInfo
+DataShards   int
+ParityShards int
+BlockSize    int
+}
+
+// AvailableShards returns the number of available shards
+func (ss *ShardSet) AvailableShards() int {
+count := 0
+for _, shard := range ss.Shards {
+if shard != nil && shard.Data != nil {
+count++
+}
+}
+return count
+}
+
+// CanReconstruct checks if enough shards are available to reconstruct data
+func (ss *ShardSet) CanReconstruct() bool {
+return ss.AvailableShards() >= ss.DataShards
+}
+
+// MissingShards returns indices of missing shards
+func (ss *ShardSet) MissingShards() []int {
+var missing []int
+for i, shard := range ss.Shards {
+if shard == nil || shard.Data == nil {
+missing = append(missing, i)
+}
+}
+return missing
+}
+```
+
+## File: pkg/ec/reedsolomon.go
+
+```go
+// path: pkg/ec/reedsolomon.go
+package ec
+
+import (
+"bytes"
+"context"
+"fmt"
+"io"
+
+"github.com/klauspost/reedsolomon"
+)
+
+// ReedSolomonCodec implements Codec using Reed-Solomon erasure coding
+type ReedSolomonCodec struct {
+encoder reedsolomon.Encoder
+dataShards   int
+parityShards int
+}
+
+// NewReedSolomonCodec creates a new Reed-Solomon codec
+func NewReedSolomonCodec(config *Config) (*ReedSolomonCodec, error) {
+if err := config.Validate(); err != nil {
+return nil, fmt.Errorf("invalid configuration: %w", err)
+}
+
+encoder, err := reedsolomon.New(config.DataShards, config.ParityShards)
+if err != nil {
+return nil, fmt.Errorf("failed to create reed-solomon encoder: %w", err)
+}
+
+return &ReedSolomonCodec{
+encoder: encoder,
+dataShards:   config.DataShards,
+parityShards: config.ParityShards,
+}, nil
+}
+
+// Encode encodes data into shards
+func (rs *ReedSolomonCodec) Encode(data []byte) ([][]byte, error) {
+// Calculate shard size
+shardSize := (len(data) + rs.dataShards - 1) / rs.dataShards
+
+// Create shards
+shards := make([][]byte, rs.TotalShards())
+
+// Split data into data shards
+for i := 0; i < rs.dataShards; i++ {
+start := i * shardSize
+end := start + shardSize
+
+if start < len(data) {
+if end > len(data) {
+end = len(data)
+}
+shards[i] = make([]byte, shardSize)
+copy(shards[i], data[start:end])
+} else {
+shards[i] = make([]byte, shardSize)
+}
+}
+
+// Create parity shards
+for i := rs.dataShards; i < rs.TotalShards(); i++ {
+shards[i] = make([]byte, shardSize)
+}
+
+// Encode
+if err := rs.encoder.Encode(shards); err != nil {
+return nil, fmt.Errorf("failed to encode shards: %w", err)
+}
+
+return shards, nil
+}
+
+// EncodeStream encodes data from a reader into shards
+func (rs *ReedSolomonCodec) EncodeStream(ctx context.Context, r io.Reader, blockSize int) ([][]byte, error) {
+// Read all data
+data, err := io.ReadAll(r)
+if err != nil {
+return nil, fmt.Errorf("failed to read data: %w", err)
+}
+
+// Encode using the standard method
+return rs.Encode(data)
+}
+
+// Decode reconstructs data from shards
+func (rs *ReedSolomonCodec) Decode(shards [][]byte) ([]byte, error) {
+if len(shards) != rs.TotalShards() {
+return nil, fmt.Errorf("expected %d shards, got %d", rs.TotalShards(), len(shards))
+}
+
+// Reconstruct missing shards if needed
+if err := rs.encoder.Reconstruct(shards); err != nil {
+return nil, fmt.Errorf("failed to reconstruct shards: %w", err)
+}
+
+// Join data shards
+var buf bytes.Buffer
+for i := 0; i < rs.dataShards; i++ {
+buf.Write(shards[i])
+}
+
+return buf.Bytes(), nil
+}
+
+// Reconstruct reconstructs missing shards
+func (rs *ReedSolomonCodec) Reconstruct(shards [][]byte) error {
+if len(shards) != rs.TotalShards() {
+return fmt.Errorf("expected %d shards, got %d", rs.TotalShards(), len(shards))
+}
+
+// Count available shards
+available := 0
+for _, shard := range shards {
+if shard != nil {
+available++
+}
+}
+
+if available < rs.dataShards {
+return fmt.Errorf("insufficient shards for reconstruction: have %d, need %d", available, rs.dataShards)
+}
+
+// Reconstruct
+if err := rs.encoder.Reconstruct(shards); err != nil {
+return fmt.Errorf("failed to reconstruct shards: %w", err)
+}
+
+return nil
+}
+
+// Verify verifies the integrity of shards
+func (rs *ReedSolomonCodec) Verify(shards [][]byte) (bool, error) {
+if len(shards) != rs.TotalShards() {
+return false, fmt.Errorf("expected %d shards, got %d", rs.TotalShards(), len(shards))
+}
+
+ok, err := rs.encoder.Verify(shards)
+if err != nil {
+return false, fmt.Errorf("failed to verify shards: %w", err)
+}
+
+return ok, nil
+}
+
+// DataShards returns the number of data shards
+func (rs *ReedSolomonCodec) DataShards() int {
+return rs.dataShards
+}
+
+// ParityShards returns the number of parity shards
+func (rs *ReedSolomonCodec) ParityShards() int {
+return rs.parityShards
+}
+
+// TotalShards returns the total number of shards
+func (rs *ReedSolomonCodec) TotalShards() int {
+return rs.dataShards + rs.parityShards
+}
+
+// Split splits data into multiple blocks for streaming
+func (rs *ReedSolomonCodec) Split(r io.Reader, blockSize int) ([][]byte, error) {
+var blocks [][]byte
+buf := make([]byte, blockSize)
+
+for {
+n, err := io.ReadFull(r, buf)
+if err == io.EOF {
+break
+}
+if err != nil && err != io.ErrUnexpectedEOF {
+return nil, fmt.Errorf("failed to read block: %w", err)
+}
+
+block := make([]byte, n)
+copy(block, buf[:n])
+blocks = append(blocks, block)
+
+if err == io.ErrUnexpectedEOF {
+break
+}
+}
+
+return blocks, nil
+}
+
+// Join joins multiple blocks into a writer
+func (rs *ReedSolomonCodec) Join(w io.Writer, blocks [][]byte) error {
+for _, block := range blocks {
+if _, err := w.Write(block); err != nil {
+return fmt.Errorf("failed to write block: %w", err)
+}
+}
+return nil
+}
+```
+
+## File: pkg/chunk/chunk.go
+
+```go
+// path: pkg/chunk/chunk.go
+package chunk
+
+import (
+"context"
+"crypto/rand"
+"encoding/binary"
+"fmt"
+"hash/crc32"
+"io"
+"os"
+"path/filepath"
+"sync"
+
+"github.com/dadyutenga/bucket/pkg/utils"
+)
+
+// ChunkManager manages chunk storage and retrieval
+type ChunkManager struct {
+basePath    string
+blockSize   int64
+enableMmap  bool
+checksumAlg string
+mu          sync.RWMutex
+}
+
+// NewChunkManager creates a new chunk manager
+func NewChunkManager(basePath string, blockSize int64, enableMmap bool, checksumAlg string) (*ChunkManager, error) {
+// Ensure base path exists
+if err := os.MkdirAll(basePath, 0755); err != nil {
+return nil, fmt.Errorf("failed to create base path: %w", err)
+}
+
+return &ChunkManager{
+basePath:    basePath,
+blockSize:   blockSize,
+enableMmap:  enableMmap,
+checksumAlg: checksumAlg,
+}, nil
+}
+
+// ChunkMetadata represents metadata for a chunk
+type ChunkMetadata struct {
+ID          string
+ObjectID    string
+Version     string
+ShardIndex  int
+Size        int64
+Checksum    uint32
+Offset      int64
+Location    string
+Compression string
+}
+
+// WriteChunk writes a chunk to storage
+func (cm *ChunkManager) WriteChunk(ctx context.Context, meta *ChunkMetadata, data []byte) error {
+cm.mu.Lock()
+defer cm.mu.Unlock()
+
+// Calculate checksum
+meta.Checksum = cm.calculateChecksum(data)
+meta.Size = int64(len(data))
+
+// Determine chunk path
+chunkPath := cm.getChunkPath(meta.ID)
+
+// Ensure directory exists
+if err := os.MkdirAll(filepath.Dir(chunkPath), 0755); err != nil {
+return fmt.Errorf("failed to create chunk directory: %w", err)
+}
+
+// Write chunk data
+if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+return fmt.Errorf("failed to write chunk: %w", err)
+}
+
+// Write metadata
+if err := cm.writeChunkMetadata(meta); err != nil {
+// Clean up chunk file on metadata write failure
+os.Remove(chunkPath)
+return fmt.Errorf("failed to write chunk metadata: %w", err)
+}
+
+meta.Location = chunkPath
+
+return nil
+}
+
+// ReadChunk reads a chunk from storage
+func (cm *ChunkManager) ReadChunk(ctx context.Context, chunkID string) (*ChunkMetadata, []byte, error) {
+cm.mu.RLock()
+defer cm.mu.RUnlock()
+
+// Read metadata
+meta, err := cm.readChunkMetadata(chunkID)
+if err != nil {
+return nil, nil, fmt.Errorf("failed to read chunk metadata: %w", err)
+}
+
+// Read chunk data
+chunkPath := cm.getChunkPath(chunkID)
+data, err := os.ReadFile(chunkPath)
+if err != nil {
+return nil, nil, fmt.Errorf("failed to read chunk: %w", err)
+}
+
+// Verify checksum
+checksum := cm.calculateChecksum(data)
+if checksum != meta.Checksum {
+return nil, nil, utils.ErrChecksumMismatch
+}
+
+return meta, data, nil
+}
+
+// DeleteChunk deletes a chunk from storage
+func (cm *ChunkManager) DeleteChunk(ctx context.Context, chunkID string) error {
+cm.mu.Lock()
+defer cm.mu.Unlock()
+
+// Delete chunk data
+chunkPath := cm.getChunkPath(chunkID)
+if err := os.Remove(chunkPath); err != nil && !os.IsNotExist(err) {
+return fmt.Errorf("failed to delete chunk: %w", err)
+}
+
+// Delete metadata
+metaPath := cm.getChunkMetadataPath(chunkID)
+if err := os.Remove(metaPath); err != nil && !os.IsNotExist(err) {
+return fmt.Errorf("failed to delete chunk metadata: %w", err)
+}
+
+return nil
+}
+
+// getChunkPath returns the file path for a chunk
+func (cm *ChunkManager) getChunkPath(chunkID string) string {
+// Use first 2 characters of ID for directory sharding
+if len(chunkID) < 2 {
+return filepath.Join(cm.basePath, "chunks", chunkID)
+}
+return filepath.Join(cm.basePath, "chunks", chunkID[:2], chunkID)
+}
+
+// getChunkMetadataPath returns the file path for chunk metadata
+func (cm *ChunkManager) getChunkMetadataPath(chunkID string) string {
+if len(chunkID) < 2 {
+return filepath.Join(cm.basePath, "metadata", chunkID+".meta")
+}
+return filepath.Join(cm.basePath, "metadata", chunkID[:2], chunkID+".meta")
+}
+
+// calculateChecksum calculates checksum for data
+func (cm *ChunkManager) calculateChecksum(data []byte) uint32 {
+switch cm.checksumAlg {
+case "crc32c":
+table := crc32.MakeTable(crc32.Castagnoli)
+return crc32.Checksum(data, table)
+default:
+// Default to CRC32
+return crc32.ChecksumIEEE(data)
+}
+}
+
+// writeChunkMetadata writes chunk metadata to disk
+func (cm *ChunkManager) writeChunkMetadata(meta *ChunkMetadata) error {
+metaPath := cm.getChunkMetadataPath(meta.ID)
+
+// Ensure directory exists
+if err := os.MkdirAll(filepath.Dir(metaPath), 0755); err != nil {
+return fmt.Errorf("failed to create metadata directory: %w", err)
+}
+
+// Serialize metadata
+data := cm.serializeMetadata(meta)
+
+// Write metadata file
+if err := os.WriteFile(metaPath, data, 0644); err != nil {
+return fmt.Errorf("failed to write metadata file: %w", err)
+}
+
+return nil
+}
+
+// readChunkMetadata reads chunk metadata from disk
+func (cm *ChunkManager) readChunkMetadata(chunkID string) (*ChunkMetadata, error) {
+metaPath := cm.getChunkMetadataPath(chunkID)
+
+// Read metadata file
+data, err := os.ReadFile(metaPath)
+if err != nil {
+if os.IsNotExist(err) {
+return nil, utils.ErrNotFound
+}
+return nil, fmt.Errorf("failed to read metadata file: %w", err)
+}
+
+// Deserialize metadata
+meta, err := cm.deserializeMetadata(data)
+if err != nil {
+return nil, fmt.Errorf("failed to deserialize metadata: %w", err)
+}
+
+return meta, nil
+}
+
+// serializeMetadata serializes chunk metadata to bytes
+func (cm *ChunkManager) serializeMetadata(meta *ChunkMetadata) []byte {
+// Simple binary format:
+// [ID length][ID][ObjectID length][ObjectID][Version length][Version]
+// [ShardIndex][Size][Checksum][Offset][Location length][Location]
+
+var buf []byte
+
+// Helper to append string
+appendString := func(s string) {
+buf = append(buf, byte(len(s)))
+buf = append(buf, []byte(s)...)
+}
+
+// Helper to append int64
+appendInt64 := func(n int64) {
+b := make([]byte, 8)
+binary.LittleEndian.PutUint64(b, uint64(n))
+buf = append(buf, b...)
+}
+
+// Helper to append uint32
+appendUint32 := func(n uint32) {
+b := make([]byte, 4)
+binary.LittleEndian.PutUint32(b, n)
+buf = append(buf, b...)
+}
+
+appendString(meta.ID)
+appendString(meta.ObjectID)
+appendString(meta.Version)
+appendInt64(int64(meta.ShardIndex))
+appendInt64(meta.Size)
+appendUint32(meta.Checksum)
+appendInt64(meta.Offset)
+appendString(meta.Location)
+appendString(meta.Compression)
+
+return buf
+}
+
+// deserializeMetadata deserializes chunk metadata from bytes
+func (cm *ChunkManager) deserializeMetadata(data []byte) (*ChunkMetadata, error) {
+meta := &ChunkMetadata{}
+pos := 0
+
+// Helper to read string
+readString := func() (string, error) {
+if pos >= len(data) {
+return "", fmt.Errorf("unexpected end of data")
+}
+length := int(data[pos])
+pos++
+if pos+length > len(data) {
+return "", fmt.Errorf("unexpected end of data")
+}
+s := string(data[pos : pos+length])
+pos += length
+return s, nil
+}
+
+// Helper to read int64
+readInt64 := func() (int64, error) {
+if pos+8 > len(data) {
+return 0, fmt.Errorf("unexpected end of data")
+}
+n := int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+pos += 8
+return n, nil
+}
+
+// Helper to read uint32
+readUint32 := func() (uint32, error) {
+if pos+4 > len(data) {
+return 0, fmt.Errorf("unexpected end of data")
+}
+n := binary.LittleEndian.Uint32(data[pos : pos+4])
+pos += 4
+return n, nil
+}
+
+var err error
+
+meta.ID, err = readString()
+if err != nil {
+return nil, err
+}
+
+meta.ObjectID, err = readString()
+if err != nil {
+return nil, err
+}
+
+meta.Version, err = readString()
+if err != nil {
+return nil, err
+}
+
+shardIndex, err := readInt64()
+if err != nil {
+return nil, err
+}
+meta.ShardIndex = int(shardIndex)
+
+meta.Size, err = readInt64()
+if err != nil {
+return nil, err
+}
+
+meta.Checksum, err = readUint32()
+if err != nil {
+return nil, err
+}
+
+meta.Offset, err = readInt64()
+if err != nil {
+return nil, err
+}
+
+meta.Location, err = readString()
+if err != nil {
+return nil, err
+}
+
+meta.Compression, err = readString()
+if err != nil {
+return nil, err
+}
+
+return meta, nil
+}
+
+// GenerateChunkID generates a unique chunk ID
+func GenerateChunkID() string {
+b := make([]byte, 16)
+rand.Read(b)
+return fmt.Sprintf("%x", b)
+}
+
+// StreamWriter provides streaming write capabilities
+type StreamWriter struct {
+cm       *ChunkManager
+buffer   []byte
+offset   int64
+chunkID  string
+objectID string
+version  string
+shardIdx int
+}
+
+// NewStreamWriter creates a new stream writer
+func (cm *ChunkManager) NewStreamWriter(objectID, version string, shardIndex int) *StreamWriter {
+return &StreamWriter{
+cm:       cm,
+buffer:   make([]byte, 0, cm.blockSize),
+chunkID:  GenerateChunkID(),
+objectID: objectID,
+version:  version,
+shardIdx: shardIndex,
+}
+}
+
+// Write writes data to the stream
+func (sw *StreamWriter) Write(p []byte) (n int, err error) {
+sw.buffer = append(sw.buffer, p...)
+
+// Flush if buffer is full
+if int64(len(sw.buffer)) >= sw.cm.blockSize {
+if err := sw.Flush(); err != nil {
+return 0, err
+}
+}
+
+return len(p), nil
+}
+
+// Flush flushes the buffer to storage
+func (sw *StreamWriter) Flush() error {
+if len(sw.buffer) == 0 {
+return nil
+}
+
+meta := &ChunkMetadata{
+ID:         sw.chunkID,
+ObjectID:   sw.objectID,
+Version:    sw.version,
+ShardIndex: sw.shardIdx,
+Offset:     sw.offset,
+}
+
+if err := sw.cm.WriteChunk(context.Background(), meta, sw.buffer); err != nil {
+return err
+}
+
+sw.offset += int64(len(sw.buffer))
+sw.buffer = sw.buffer[:0]
+sw.chunkID = GenerateChunkID()
+
+return nil
+}
+
+// Close closes the stream writer
+func (sw *StreamWriter) Close() error {
+return sw.Flush()
+}
+```
+
+
+## File: pkg/chunk/packer.go
+
+```go
+// path: pkg/chunk/packer.go
+package chunk
+
+import (
+"context"
+"encoding/json"
+"fmt"
+"os"
+"path/filepath"
+"sync"
+)
+
+// SmallFilePacker packs small files into larger segments to reduce inode usage
+type SmallFilePacker struct {
+basePath       string
+threshold      int64
+segmentSize    int64
+currentSegment *PackSegment
+index          *PackIndex
+mu             sync.Mutex
+}
+
+// PackSegment represents a segment containing multiple small files
+type PackSegment struct {
+ID       string
+Offset   int64
+Size     int64
+FilePath string
+Entries  []*PackEntry
+}
+
+// PackEntry represents an entry in a pack segment
+type PackEntry struct {
+ObjectID string
+Version  string
+Offset   int64
+Size     int64
+Checksum uint32
+}
+
+// PackIndex maintains an index of all packed files
+type PackIndex struct {
+Segments map[string]*PackSegment
+Objects  map[string]*PackEntry
+mu       sync.RWMutex
+}
+
+// NewSmallFilePacker creates a new small file packer
+func NewSmallFilePacker(basePath string, threshold, segmentSize int64) (*SmallFilePacker, error) {
+if err := os.MkdirAll(filepath.Join(basePath, "packs"), 0755); err != nil {
+return nil, fmt.Errorf("failed to create packs directory: %w", err)
+}
+
+packer := &SmallFilePacker{
+basePath:    basePath,
+threshold:   threshold,
+segmentSize: segmentSize,
+index: &PackIndex{
+Segments: make(map[string]*PackSegment),
+Objects:  make(map[string]*PackEntry),
+},
+}
+
+// Load existing index
+if err := packer.loadIndex(); err != nil {
+// If index doesn't exist, create new one
+if !os.IsNotExist(err) {
+return nil, fmt.Errorf("failed to load index: %w", err)
+}
+}
+
+return packer, nil
+}
+
+// PackFile packs a small file
+func (p *SmallFilePacker) PackFile(ctx context.Context, objectID, version string, data []byte) (*PackEntry, error) {
+if int64(len(data)) > p.threshold {
+return nil, fmt.Errorf("file too large for packing")
+}
+
+p.mu.Lock()
+defer p.mu.Unlock()
+
+// Check if we need a new segment
+if p.currentSegment == nil || p.currentSegment.Offset+int64(len(data)) > p.segmentSize {
+if err := p.createNewSegment(); err != nil {
+return nil, fmt.Errorf("failed to create new segment: %w", err)
+}
+}
+
+// Calculate checksum
+checksum := p.calculateChecksum(data)
+
+// Create pack entry
+entry := &PackEntry{
+ObjectID: objectID,
+Version:  version,
+Offset:   p.currentSegment.Offset,
+Size:     int64(len(data)),
+Checksum: checksum,
+}
+
+// Write data to segment
+if err := p.writeToSegment(p.currentSegment, data); err != nil {
+return nil, fmt.Errorf("failed to write to segment: %w", err)
+}
+
+// Update segment
+p.currentSegment.Entries = append(p.currentSegment.Entries, entry)
+p.currentSegment.Offset += int64(len(data))
+p.currentSegment.Size += int64(len(data))
+
+// Update index
+key := objectID + ":" + version
+p.index.Objects[key] = entry
+
+// Save index
+if err := p.saveIndex(); err != nil {
+return nil, fmt.Errorf("failed to save index: %w", err)
+}
+
+return entry, nil
+}
+
+// UnpackFile retrieves a packed file
+func (p *SmallFilePacker) UnpackFile(ctx context.Context, objectID, version string) ([]byte, error) {
+p.mu.Lock()
+defer p.mu.Unlock()
+
+// Find entry in index
+key := objectID + ":" + version
+entry, ok := p.index.Objects[key]
+if !ok {
+return nil, fmt.Errorf("object not found in pack index")
+}
+
+// Find segment
+var segment *PackSegment
+for _, seg := range p.index.Segments {
+for _, e := range seg.Entries {
+if e.ObjectID == objectID && e.Version == version {
+segment = seg
+break
+}
+}
+if segment != nil {
+break
+}
+}
+
+if segment == nil {
+return nil, fmt.Errorf("segment not found")
+}
+
+// Read from segment
+data, err := p.readFromSegment(segment, entry.Offset, entry.Size)
+if err != nil {
+return nil, fmt.Errorf("failed to read from segment: %w", err)
+}
+
+// Verify checksum
+checksum := p.calculateChecksum(data)
+if checksum != entry.Checksum {
+return nil, fmt.Errorf("checksum mismatch")
+}
+
+return data, nil
+}
+
+// createNewSegment creates a new pack segment
+func (p *SmallFilePacker) createNewSegment() error {
+segment := &PackSegment{
+ID:       GenerateChunkID(),
+Offset:   0,
+Size:     0,
+FilePath: filepath.Join(p.basePath, "packs", GenerateChunkID()+".pack"),
+Entries:  make([]*PackEntry, 0),
+}
+
+// Create segment file
+f, err := os.Create(segment.FilePath)
+if err != nil {
+return fmt.Errorf("failed to create segment file: %w", err)
+}
+defer f.Close()
+
+// Preallocate space
+if err := f.Truncate(p.segmentSize); err != nil {
+return fmt.Errorf("failed to preallocate segment: %w", err)
+}
+
+p.currentSegment = segment
+p.index.Segments[segment.ID] = segment
+
+return nil
+}
+
+// writeToSegment writes data to a segment
+func (p *SmallFilePacker) writeToSegment(segment *PackSegment, data []byte) error {
+f, err := os.OpenFile(segment.FilePath, os.O_RDWR, 0644)
+if err != nil {
+return fmt.Errorf("failed to open segment file: %w", err)
+}
+defer f.Close()
+
+if _, err := f.Seek(segment.Offset, 0); err != nil {
+return fmt.Errorf("failed to seek in segment: %w", err)
+}
+
+if _, err := f.Write(data); err != nil {
+return fmt.Errorf("failed to write to segment: %w", err)
+}
+
+return nil
+}
+
+// readFromSegment reads data from a segment
+func (p *SmallFilePacker) readFromSegment(segment *PackSegment, offset, size int64) ([]byte, error) {
+f, err := os.Open(segment.FilePath)
+if err != nil {
+return nil, fmt.Errorf("failed to open segment file: %w", err)
+}
+defer f.Close()
+
+if _, err := f.Seek(offset, 0); err != nil {
+return nil, fmt.Errorf("failed to seek in segment: %w", err)
+}
+
+data := make([]byte, size)
+if _, err := f.Read(data); err != nil {
+return nil, fmt.Errorf("failed to read from segment: %w", err)
+}
+
+return data, nil
+}
+
+// calculateChecksum calculates CRC32 checksum
+func (p *SmallFilePacker) calculateChecksum(data []byte) uint32 {
+return utils.CRC32CHash(data)
+}
+
+// loadIndex loads the pack index from disk
+func (p *SmallFilePacker) loadIndex() error {
+indexPath := filepath.Join(p.basePath, "pack-index.json")
+data, err := os.ReadFile(indexPath)
+if err != nil {
+return err
+}
+
+return json.Unmarshal(data, p.index)
+}
+
+// saveIndex saves the pack index to disk
+func (p *SmallFilePacker) saveIndex() error {
+indexPath := filepath.Join(p.basePath, "pack-index.json")
+data, err := json.MarshalIndent(p.index, "", "  ")
+if err != nil {
+return fmt.Errorf("failed to marshal index: %w", err)
+}
+
+return os.WriteFile(indexPath, data, 0644)
+}
+```
+
+---
+
+# PART 5: Placement & Ring Management
+
+## File: pkg/placement/ring.go
+
+```go
+// path: pkg/placement/ring.go
+package placement
+
+import (
+"crypto/md5"
+"encoding/binary"
+"fmt"
+"hash/crc32"
+"sort"
+"sync"
+"time"
+)
+
+// Node represents a storage node in the ring
+type Node struct {
+ID       string
+Host     string
+Port     int
+GRPCPort int
+Status   NodeStatus
+Weight   int
+LastSeen time.Time
+Metadata map[string]string
+}
+
+// NodeStatus represents the status of a node
+type NodeStatus string
+
+const (
+NodeStatusActive   NodeStatus = "active"
+NodeStatusInactive NodeStatus = "inactive"
+NodeStatusDrained  NodeStatus = "drained"
+)
+
+// VirtualNode represents a virtual node on the ring
+type VirtualNode struct {
+Hash   uint32
+NodeID string
+Index  int
+}
+
+// Ring manages consistent hashing ring for placement
+type Ring struct {
+nodes         map[string]*Node
+virtualNodes  []*VirtualNode
+vnodePerNode  int
+replicaCount  int
+mu            sync.RWMutex
+version       uint64
+}
+
+// NewRing creates a new placement ring
+func NewRing(vnodePerNode, replicaCount int) *Ring {
+return &Ring{
+nodes:        make(map[string]*Node),
+virtualNodes: make([]*VirtualNode, 0),
+vnodePerNode: vnodePerNode,
+replicaCount: replicaCount,
+version:      1,
+}
+}
+
+// AddNode adds a node to the ring
+func (r *Ring) AddNode(node *Node) error {
+r.mu.Lock()
+defer r.mu.Unlock()
+
+if _, exists := r.nodes[node.ID]; exists {
+return fmt.Errorf("node already exists: %s", node.ID)
+}
+
+// Add node
+r.nodes[node.ID] = node
+
+// Create virtual nodes
+for i := 0; i < r.vnodePerNode; i++ {
+vnode := &VirtualNode{
+Hash:   r.hashVirtualNode(node.ID, i),
+NodeID: node.ID,
+Index:  i,
+}
+r.virtualNodes = append(r.virtualNodes, vnode)
+}
+
+// Sort virtual nodes by hash
+sort.Slice(r.virtualNodes, func(i, j int) bool {
+return r.virtualNodes[i].Hash < r.virtualNodes[j].Hash
+})
+
+r.version++
+
+return nil
+}
+
+// RemoveNode removes a node from the ring
+func (r *Ring) RemoveNode(nodeID string) error {
+r.mu.Lock()
+defer r.mu.Unlock()
+
+if _, exists := r.nodes[nodeID]; !exists {
+return fmt.Errorf("node not found: %s", nodeID)
+}
+
+// Remove node
+delete(r.nodes, nodeID)
+
+// Remove virtual nodes
+filtered := make([]*VirtualNode, 0, len(r.virtualNodes))
+for _, vnode := range r.virtualNodes {
+if vnode.NodeID != nodeID {
+filtered = append(filtered, vnode)
+}
+}
+r.virtualNodes = filtered
+
+r.version++
+
+return nil
+}
+
+// UpdateNodeStatus updates the status of a node
+func (r *Ring) UpdateNodeStatus(nodeID string, status NodeStatus) error {
+r.mu.Lock()
+defer r.mu.Unlock()
+
+node, exists := r.nodes[nodeID]
+if !exists {
+return fmt.Errorf("node not found: %s", nodeID)
+}
+
+node.Status = status
+node.LastSeen = time.Now()
+
+return nil
+}
+
+// GetNodes returns nodes responsible for a key
+func (r *Ring) GetNodes(key string, count int) ([]*Node, error) {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+if len(r.nodes) == 0 {
+return nil, fmt.Errorf("no nodes available")
+}
+
+if count > len(r.nodes) {
+count = len(r.nodes)
+}
+
+// Hash the key
+keyHash := r.hashKey(key)
+
+// Find position in virtual nodes
+idx := r.searchVirtualNodes(keyHash)
+
+// Collect unique nodes
+selectedNodes := make([]*Node, 0, count)
+seen := make(map[string]bool)
+
+for i := 0; i < len(r.virtualNodes) && len(selectedNodes) < count; i++ {
+vnodeIdx := (idx + i) % len(r.virtualNodes)
+vnode := r.virtualNodes[vnodeIdx]
+
+if seen[vnode.NodeID] {
+continue
+}
+
+node := r.nodes[vnode.NodeID]
+if node.Status == NodeStatusActive {
+selectedNodes = append(selectedNodes, node)
+seen[vnode.NodeID] = true
+}
+}
+
+if len(selectedNodes) == 0 {
+return nil, fmt.Errorf("no active nodes available")
+}
+
+return selectedNodes, nil
+}
+
+// GetAllNodes returns all nodes in the ring
+func (r *Ring) GetAllNodes() []*Node {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+nodes := make([]*Node, 0, len(r.nodes))
+for _, node := range r.nodes {
+nodes = append(nodes, node)
+}
+
+return nodes
+}
+
+// GetActiveNodes returns all active nodes
+func (r *Ring) GetActiveNodes() []*Node {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+nodes := make([]*Node, 0)
+for _, node := range r.nodes {
+if node.Status == NodeStatusActive {
+nodes = append(nodes, node)
+}
+}
+
+return nodes
+}
+
+// GetNode returns a specific node
+func (r *Ring) GetNode(nodeID string) (*Node, error) {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+node, exists := r.nodes[nodeID]
+if !exists {
+return nil, fmt.Errorf("node not found: %s", nodeID)
+}
+
+return node, nil
+}
+
+// NodeCount returns the number of nodes
+func (r *Ring) NodeCount() int {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+return len(r.nodes)
+}
+
+// Version returns the current ring version
+func (r *Ring) Version() uint64 {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+return r.version
+}
+
+// hashKey hashes a key to a position on the ring
+func (r *Ring) hashKey(key string) uint32 {
+h := crc32.NewIEEE()
+h.Write([]byte(key))
+return h.Sum32()
+}
+
+// hashVirtualNode hashes a virtual node identifier
+func (r *Ring) hashVirtualNode(nodeID string, index int) uint32 {
+h := md5.New()
+h.Write([]byte(fmt.Sprintf("%s:%d", nodeID, index)))
+hash := h.Sum(nil)
+return binary.LittleEndian.Uint32(hash)
+}
+
+// searchVirtualNodes performs binary search on virtual nodes
+func (r *Ring) searchVirtualNodes(hash uint32) int {
+idx := sort.Search(len(r.virtualNodes), func(i int) bool {
+return r.virtualNodes[i].Hash >= hash
+})
+
+if idx >= len(r.virtualNodes) {
+idx = 0
+}
+
+return idx
+}
+
+// RingSnapshot represents a point-in-time snapshot of the ring
+type RingSnapshot struct {
+Nodes   []*Node
+Version uint64
+Time    time.Time
+}
+
+// Snapshot creates a snapshot of the current ring state
+func (r *Ring) Snapshot() *RingSnapshot {
+r.mu.RLock()
+defer r.mu.RUnlock()
+
+nodes := make([]*Node, 0, len(r.nodes))
+for _, node := range r.nodes {
+// Create a copy
+nodeCopy := *node
+nodes = append(nodes, &nodeCopy)
+}
+
+return &RingSnapshot{
+Nodes:   nodes,
+Version: r.version,
+Time:    time.Now(),
+}
+}
+```
+
+## File: pkg/placement/rendezvous.go
+
+```go
+// path: pkg/placement/rendezvous.go
+package placement
+
+import (
+"fmt"
+"hash/fnv"
+"sort"
+)
+
+// RendezvousHash implements highest random weight (HRW) hashing
+type RendezvousHash struct {
+nodes []*Node
+}
+
+// NewRendezvousHash creates a new rendezvous hash
+func NewRendezvousHash(nodes []*Node) *RendezvousHash {
+return &RendezvousHash{
+nodes: nodes,
+}
+}
+
+// GetNodes returns nodes for a key using rendezvous hashing
+func (rh *RendezvousHash) GetNodes(key string, count int) ([]*Node, error) {
+if len(rh.nodes) == 0 {
+return nil, fmt.Errorf("no nodes available")
+}
+
+if count > len(rh.nodes) {
+count = len(rh.nodes)
+}
+
+// Calculate hash weights for each node
+type nodeWeight struct {
+node   *Node
+weight uint64
+}
+
+weights := make([]nodeWeight, 0, len(rh.nodes))
+for _, node := range rh.nodes {
+if node.Status != NodeStatusActive {
+continue
+}
+
+weight := rh.calculateWeight(key, node.ID)
+weights = append(weights, nodeWeight{node: node, weight: weight})
+}
+
+if len(weights) == 0 {
+return nil, fmt.Errorf("no active nodes available")
+}
+
+// Sort by weight (descending)
+sort.Slice(weights, func(i, j int) bool {
+return weights[i].weight > weights[j].weight
+})
+
+// Select top N nodes
+selected := make([]*Node, 0, count)
+for i := 0; i < count && i < len(weights); i++ {
+selected = append(selected, weights[i].node)
+}
+
+return selected, nil
+}
+
+// calculateWeight calculates the weight for a key-node pair
+func (rh *RendezvousHash) calculateWeight(key, nodeID string) uint64 {
+h := fnv.New64a()
+h.Write([]byte(key + nodeID))
+return h.Sum64()
+}
+
+// UpdateNodes updates the node list
+func (rh *RendezvousHash) UpdateNodes(nodes []*Node) {
+rh.nodes = nodes
+}
+```
+
+## File: pkg/placement/rebalancer.go
+
+```go
+// path: pkg/placement/rebalancer.go
+package placement
+
+import (
+"context"
+"fmt"
+"sync"
+"time"
+
+"github.com/dadyutenga/bucket/pkg/observe"
+)
+
+// RebalanceTask represents a rebalancing task
+type RebalanceTask struct {
+ID              string
+ObjectID        string
+Version         string
+SourceNode      string
+DestinationNode string
+ShardIndex      int
+Status          RebalanceStatus
+CreatedAt       time.Time
+StartedAt       *time.Time
+CompletedAt     *time.Time
+Error           string
+}
+
+// RebalanceStatus represents the status of a rebalance task
+type RebalanceStatus string
+
+const (
+RebalanceStatusPending   RebalanceStatus = "pending"
+RebalanceStatusRunning   RebalanceStatus = "running"
+RebalanceStatusCompleted RebalanceStatus = "completed"
+RebalanceStatusFailed    RebalanceStatus = "failed"
+)
+
+// Rebalancer manages data rebalancing operations
+type Rebalancer struct {
+ring     *Ring
+logger   *observe.Logger
+metrics  *observe.Metrics
+tasks    map[string]*RebalanceTask
+workers  int
+mu       sync.RWMutex
+stopCh   chan struct{}
+wg       sync.WaitGroup
+}
+
+// NewRebalancer creates a new rebalancer
+func NewRebalancer(ring *Ring, workers int, logger *observe.Logger, metrics *observe.Metrics) *Rebalancer {
+return &Rebalancer{
+ring:    ring,
+logger:  logger,
+metrics: metrics,
+tasks:   make(map[string]*RebalanceTask),
+workers: workers,
+stopCh:  make(chan struct{}),
+}
+}
+
+// Start starts the rebalancer
+func (rb *Rebalancer) Start(ctx context.Context) error {
+rb.logger.Info("starting rebalancer", "workers", rb.workers)
+
+// Start worker goroutines
+for i := 0; i < rb.workers; i++ {
+rb.wg.Add(1)
+go rb.worker(ctx, i)
+}
+
+return nil
+}
+
+// Stop stops the rebalancer
+func (rb *Rebalancer) Stop() error {
+rb.logger.Info("stopping rebalancer")
+
+close(rb.stopCh)
+rb.wg.Wait()
+
+return nil
+}
+
+// worker processes rebalance tasks
+func (rb *Rebalancer) worker(ctx context.Context, workerID int) {
+defer rb.wg.Done()
+
+rb.logger.Info("rebalancer worker started", "worker_id", workerID)
+
+ticker := time.NewTicker(10 * time.Second)
+defer ticker.Stop()
+
+for {
+select {
+case <-ctx.Done():
+return
+case <-rb.stopCh:
+return
+case <-ticker.C:
+// Process pending tasks
+task := rb.getNextTask()
+if task == nil {
+continue
+}
+
+if err := rb.processTask(ctx, task); err != nil {
+rb.logger.Error("failed to process rebalance task",
+"task_id", task.ID,
+"error", err,
+)
+rb.markTaskFailed(task.ID, err.Error())
+} else {
+rb.markTaskCompleted(task.ID)
+}
+}
+}
+}
+
+// getNextTask retrieves the next pending task
+func (rb *Rebalancer) getNextTask() *RebalanceTask {
+rb.mu.Lock()
+defer rb.mu.Unlock()
+
+for _, task := range rb.tasks {
+if task.Status == RebalanceStatusPending {
+task.Status = RebalanceStatusRunning
+now := time.Now()
+task.StartedAt = &now
+return task
+}
+}
+
+return nil
+}
+
+// processTask processes a rebalance task
+func (rb *Rebalancer) processTask(ctx context.Context, task *RebalanceTask) error {
+rb.logger.Info("processing rebalance task",
+"task_id", task.ID,
+"object_id", task.ObjectID,
+"source", task.SourceNode,
+"destination", task.DestinationNode,
+)
+
+// TODO: Implement actual data movement
+// 1. Read shard from source node
+// 2. Write shard to destination node
+// 3. Verify checksum
+// 4. Update metadata
+// 5. Delete shard from source node (optional, can be done later)
+
+// For now, simulate the operation
+time.Sleep(1 * time.Second)
+
+rb.logger.Info("rebalance task completed", "task_id", task.ID)
+
+return nil
+}
+
+// AddTask adds a rebalance task
+func (rb *Rebalancer) AddTask(task *RebalanceTask) {
+rb.mu.Lock()
+defer rb.mu.Unlock()
+
+rb.tasks[task.ID] = task
+}
+
+// markTaskCompleted marks a task as completed
+func (rb *Rebalancer) markTaskCompleted(taskID string) {
+rb.mu.Lock()
+defer rb.mu.Unlock()
+
+task, exists := rb.tasks[taskID]
+if !exists {
+return
+}
+
+task.Status = RebalanceStatusCompleted
+now := time.Now()
+task.CompletedAt = &now
+}
+
+// markTaskFailed marks a task as failed
+func (rb *Rebalancer) markTaskFailed(taskID, errorMsg string) {
+rb.mu.Lock()
+defer rb.mu.Unlock()
+
+task, exists := rb.tasks[taskID]
+if !exists {
+return
+}
+
+task.Status = RebalanceStatusFailed
+task.Error = errorMsg
+}
+
+// GetTask retrieves a task by ID
+func (rb *Rebalancer) GetTask(taskID string) (*RebalanceTask, error) {
+rb.mu.RLock()
+defer rb.mu.RUnlock()
+
+task, exists := rb.tasks[taskID]
+if !exists {
+return nil, fmt.Errorf("task not found: %s", taskID)
+}
+
+return task, nil
+}
+
+// ListTasks lists all tasks
+func (rb *Rebalancer) ListTasks() []*RebalanceTask {
+rb.mu.RLock()
+defer rb.mu.RUnlock()
+
+tasks := make([]*RebalanceTask, 0, len(rb.tasks))
+for _, task := range rb.tasks {
+tasks = append(tasks, task)
+}
+
+return tasks
+}
+
+// GenerateRebalancePlan generates a rebalancing plan after ring changes
+func (rb *Rebalancer) GenerateRebalancePlan(oldSnapshot, newSnapshot *RingSnapshot) ([]*RebalanceTask, error) {
+rb.logger.Info("generating rebalance plan",
+"old_version", oldSnapshot.Version,
+"new_version", newSnapshot.Version,
+)
+
+// TODO: Implement actual plan generation
+// 1. Identify objects affected by ring changes
+// 2. Calculate new placement for each object
+// 3. Generate tasks to move shards
+
+tasks := make([]*RebalanceTask, 0)
+
+rb.logger.Info("generated rebalance plan", "task_count", len(tasks))
+
+return tasks, nil
+}
+```
+
+---
+
+# PART 6: KMS & Encryption
+
+## File: pkg/kms/kms.go
+
+```go
+// path: pkg/kms/kms.go
+package kms
+
+import (
+"context"
+"crypto/aes"
+"crypto/cipher"
+"crypto/rand"
+"fmt"
+"io"
+)
+
+// Provider defines the interface for Key Management Service providers
+type Provider interface {
+// GenerateDataKey generates a new data encryption key
+GenerateDataKey(ctx context.Context, keyID string) (*DataKey, error)
+
+// Encrypt encrypts a data encryption key
+EncryptDataKey(ctx context.Context, keyID string, plaintext []byte) ([]byte, error)
+
+// Decrypt decrypts a data encryption key
+DecryptDataKey(ctx context.Context, keyID string, ciphertext []byte) ([]byte, error)
+
+// GenerateMasterKey generates a new master key
+GenerateMasterKey(ctx context.Context, keyID string) error
+
+// RotateMasterKey rotates a master key
+RotateMasterKey(ctx context.Context, keyID string) error
+}
+
+// DataKey represents a data encryption key
+type DataKey struct {
+KeyID      string
+Plaintext  []byte
+Ciphertext []byte
+}
+
+// EncryptionContext represents additional authenticated data
+type EncryptionContext map[string]string
+
+// EncryptObject encrypts object data using envelope encryption
+func EncryptObject(ctx context.Context, provider Provider, keyID string, data []byte) ([]byte, *DataKey, error) {
+// Generate data encryption key
+dek, err := provider.GenerateDataKey(ctx, keyID)
+if err != nil {
+return nil, nil, fmt.Errorf("failed to generate data key: %w", err)
+}
+
+// Create AES-GCM cipher
+block, err := aes.NewCipher(dek.Plaintext)
+if err != nil {
+return nil, nil, fmt.Errorf("failed to create cipher: %w", err)
+}
+
+gcm, err := cipher.NewGCM(block)
+if err != nil {
+return nil, nil, fmt.Errorf("failed to create GCM: %w", err)
+}
+
+// Generate nonce
+nonce := make([]byte, gcm.NonceSize())
+if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+return nil, nil, fmt.Errorf("failed to generate nonce: %w", err)
+}
+
+// Encrypt data
+ciphertext := gcm.Seal(nonce, nonce, data, nil)
+
+return ciphertext, dek, nil
+}
+
+// DecryptObject decrypts object data using envelope encryption
+func DecryptObject(ctx context.Context, provider Provider, keyID string, encryptedDEK, ciphertext []byte) ([]byte, error) {
+// Decrypt data encryption key
+dek, err := provider.DecryptDataKey(ctx, keyID, encryptedDEK)
+if err != nil {
+return nil, fmt.Errorf("failed to decrypt data key: %w", err)
+}
+
+// Create AES-GCM cipher
+block, err := aes.NewCipher(dek)
+if err != nil {
+return nil, fmt.Errorf("failed to create cipher: %w", err)
+}
+
+gcm, err := cipher.NewGCM(block)
+if err != nil {
+return nil, fmt.Errorf("failed to create GCM: %w", err)
+}
+
+// Extract nonce
+nonceSize := gcm.NonceSize()
+if len(ciphertext) < nonceSize {
+return nil, fmt.Errorf("ciphertext too short")
+}
+
+nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+// Decrypt data
+plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+if err != nil {
+return nil, fmt.Errorf("failed to decrypt data: %w", err)
+}
+
+return plaintext, nil
+}
+
+// GenerateKey generates a random encryption key
+func GenerateKey(size int) ([]byte, error) {
+key := make([]byte, size)
+if _, err := io.ReadFull(rand.Reader, key); err != nil {
+return nil, fmt.Errorf("failed to generate key: %w", err)
+}
+return key, nil
+}
+```
+
+## File: pkg/kms/local.go
+
+```go
+// path: pkg/kms/local.go
+package kms
+
+import (
+"context"
+"crypto/aes"
+"crypto/cipher"
+"crypto/rand"
+"fmt"
+"io"
+"os"
+"sync"
+)
+
+// LocalProvider implements a local file-based KMS provider
+type LocalProvider struct {
+masterKeyPath string
+masterKey     []byte
+mu            sync.RWMutex
+}
+
+// NewLocalProvider creates a new local KMS provider
+func NewLocalProvider(masterKeyPath string) (*LocalProvider, error) {
+provider := &LocalProvider{
+masterKeyPath: masterKeyPath,
+}
+
+// Load or generate master key
+if err := provider.loadOrGenerateMasterKey(); err != nil {
+return nil, fmt.Errorf("failed to initialize master key: %w", err)
+}
+
+return provider, nil
+}
+
+// GenerateDataKey generates a new data encryption key
+func (lp *LocalProvider) GenerateDataKey(ctx context.Context, keyID string) (*DataKey, error) {
+lp.mu.RLock()
+defer lp.mu.RUnlock()
+
+// Generate random DEK
+plaintext := make([]byte, 32) // 256-bit key
+if _, err := io.ReadFull(rand.Reader, plaintext); err != nil {
+return nil, fmt.Errorf("failed to generate DEK: %w", err)
+}
+
+// Encrypt DEK with master key
+ciphertext, err := lp.encryptWithMasterKey(plaintext)
+if err != nil {
+return nil, fmt.Errorf("failed to encrypt DEK: %w", err)
+}
+
+return &DataKey{
+KeyID:      keyID,
+Plaintext:  plaintext,
+Ciphertext: ciphertext,
+}, nil
+}
+
+// EncryptDataKey encrypts a data encryption key
+func (lp *LocalProvider) EncryptDataKey(ctx context.Context, keyID string, plaintext []byte) ([]byte, error) {
+lp.mu.RLock()
+defer lp.mu.RUnlock()
+
+return lp.encryptWithMasterKey(plaintext)
+}
+
+// DecryptDataKey decrypts a data encryption key
+func (lp *LocalProvider) DecryptDataKey(ctx context.Context, keyID string, ciphertext []byte) ([]byte, error) {
+lp.mu.RLock()
+defer lp.mu.RUnlock()
+
+return lp.decryptWithMasterKey(ciphertext)
+}
+
+// GenerateMasterKey generates a new master key
+func (lp *LocalProvider) GenerateMasterKey(ctx context.Context, keyID string) error {
+lp.mu.Lock()
+defer lp.mu.Unlock()
+
+// Generate new master key
+masterKey := make([]byte, 32)
+if _, err := io.ReadFull(rand.Reader, masterKey); err != nil {
+return fmt.Errorf("failed to generate master key: %w", err)
+}
+
+// Save to file
+if err := os.WriteFile(lp.masterKeyPath, masterKey, 0600); err != nil {
+return fmt.Errorf("failed to save master key: %w", err)
+}
+
+lp.masterKey = masterKey
+
+return nil
+}
+
+// RotateMasterKey rotates the master key
+func (lp *LocalProvider) RotateMasterKey(ctx context.Context, keyID string) error {
+// For local provider, rotation is same as generating a new key
+// In production, you'd need to re-encrypt all DEKs with the new master key
+return lp.GenerateMasterKey(ctx, keyID)
+}
+
+// loadOrGenerateMasterKey loads existing master key or generates a new one
+func (lp *LocalProvider) loadOrGenerateMasterKey() error {
+// Try to load existing key
+data, err := os.ReadFile(lp.masterKeyPath)
+if err == nil {
+if len(data) != 32 {
+return fmt.Errorf("invalid master key size: %d", len(data))
+}
+lp.masterKey = data
+return nil
+}
+
+if !os.IsNotExist(err) {
+return fmt.Errorf("failed to read master key: %w", err)
+}
+
+// Generate new master key
+return lp.GenerateMasterKey(context.Background(), "default")
+}
+
+// encryptWithMasterKey encrypts data with the master key
+func (lp *LocalProvider) encryptWithMasterKey(plaintext []byte) ([]byte, error) {
+block, err := aes.NewCipher(lp.masterKey)
+if err != nil {
+return nil, fmt.Errorf("failed to create cipher: %w", err)
+}
+
+gcm, err := cipher.NewGCM(block)
+if err != nil {
+return nil, fmt.Errorf("failed to create GCM: %w", err)
+}
+
+nonce := make([]byte, gcm.NonceSize())
+if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+return nil, fmt.Errorf("failed to generate nonce: %w", err)
+}
+
+ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+
+return ciphertext, nil
+}
+
+// decryptWithMasterKey decrypts data with the master key
+func (lp *LocalProvider) decryptWithMasterKey(ciphertext []byte) ([]byte, error) {
+block, err := aes.NewCipher(lp.masterKey)
+if err != nil {
+return nil, fmt.Errorf("failed to create cipher: %w", err)
+}
+
+gcm, err := cipher.NewGCM(block)
+if err != nil {
+return nil, fmt.Errorf("failed to create GCM: %w", err)
+}
+
+nonceSize := gcm.NonceSize()
+if len(ciphertext) < nonceSize {
+return nil, fmt.Errorf("ciphertext too short")
+}
+
+nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+if err != nil {
+return nil, fmt.Errorf("failed to decrypt: %w", err)
+}
+
+return plaintext, nil
+}
+```
+
+
+---
+
+# PART 7: Database Schemas & Metadata Service
+
+## File: pkg/meta/schema.sql
+
+```sql
+-- path: pkg/meta/schema.sql
+
+-- Enable necessary extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- Create custom types
+CREATE TYPE bucket_status AS ENUM ('active', 'deleted');
+CREATE TYPE object_status AS ENUM ('active', 'deleted');
+CREATE TYPE versioning_status AS ENUM ('enabled', 'suspended', 'disabled');
+CREATE TYPE upload_status AS ENUM ('initiated', 'completed', 'aborted');
+CREATE TYPE replication_status AS ENUM ('pending', 'in_progress', 'completed', 'failed');
+
+-- Buckets table
+CREATE TABLE IF NOT EXISTS buckets (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) UNIQUE NOT NULL,
+    owner_id VARCHAR(255) NOT NULL,
+    region VARCHAR(50) NOT NULL DEFAULT 'us-east-1',
+    status bucket_status NOT NULL DEFAULT 'active',
+    versioning_status versioning_status NOT NULL DEFAULT 'disabled',
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    
+    -- Metadata
+    policy JSONB,
+    cors_config JSONB,
+    lifecycle_config JSONB,
+    encryption_config JSONB,
+    tags JSONB,
+    
+    -- Statistics
+    object_count BIGINT NOT NULL DEFAULT 0,
+    total_size BIGINT NOT NULL DEFAULT 0,
+    
+    -- Constraints
+    CONSTRAINT valid_bucket_name CHECK (name ~ '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'),
+    CONSTRAINT valid_lifecycle_config CHECK (lifecycle_config IS NULL OR jsonb_typeof(lifecycle_config) = 'object'),
+    CONSTRAINT valid_policy CHECK (policy IS NULL OR jsonb_typeof(policy) = 'object')
+);
+
+-- Indexes for buckets
+CREATE INDEX idx_buckets_owner_id ON buckets(owner_id);
+CREATE INDEX idx_buckets_status ON buckets(status);
+CREATE INDEX idx_buckets_created_at ON buckets(created_at);
+
+-- Objects table
+CREATE TABLE IF NOT EXISTS objects (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    bucket_id UUID NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+    key VARCHAR(1024) NOT NULL,
+    version_id VARCHAR(64) NOT NULL,
+    status object_status NOT NULL DEFAULT 'active',
+    is_latest BOOLEAN NOT NULL DEFAULT TRUE,
+    is_delete_marker BOOLEAN NOT NULL DEFAULT FALSE,
+    
+    -- Object metadata
+    size BIGINT NOT NULL DEFAULT 0,
+    content_type VARCHAR(255),
+    content_encoding VARCHAR(100),
+    content_language VARCHAR(100),
+    content_disposition VARCHAR(255),
+    cache_control VARCHAR(255),
+    expires TIMESTAMP WITH TIME ZONE,
+    etag VARCHAR(255) NOT NULL,
+    
+    -- Custom metadata
+    user_metadata JSONB,
+    system_metadata JSONB,
+    
+    -- Storage information
+    storage_class VARCHAR(50) NOT NULL DEFAULT 'STANDARD',
+    ec_data_shards INTEGER NOT NULL,
+    ec_parity_shards INTEGER NOT NULL,
+    shard_locations JSONB NOT NULL,
+    
+    -- Encryption
+    encryption_type VARCHAR(50),
+    encryption_key_id VARCHAR(255),
+    encryption_context JSONB,
+    
+    -- Checksums
+    md5_hash VARCHAR(32),
+    sha256_hash VARCHAR(64),
+    
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    last_modified TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    
+    -- Tags
+    tags JSONB,
+    
+    -- Constraints
+    CONSTRAINT valid_object_key CHECK (key != ''),
+    CONSTRAINT valid_shard_locations CHECK (jsonb_typeof(shard_locations) = 'array'),
+    UNIQUE (bucket_id, key, version_id)
+);
+
+-- Indexes for objects
+CREATE INDEX idx_objects_bucket_id ON objects(bucket_id);
+CREATE INDEX idx_objects_bucket_key ON objects(bucket_id, key);
+CREATE INDEX idx_objects_bucket_key_version ON objects(bucket_id, key, version_id);
+CREATE INDEX idx_objects_is_latest ON objects(bucket_id, key) WHERE is_latest = TRUE;
+CREATE INDEX idx_objects_status ON objects(status);
+CREATE INDEX idx_objects_created_at ON objects(created_at);
+CREATE INDEX idx_objects_last_modified ON objects(last_modified);
+CREATE INDEX idx_objects_storage_class ON objects(storage_class);
+CREATE INDEX idx_objects_user_metadata_gin ON objects USING gin(user_metadata);
+CREATE INDEX idx_objects_tags_gin ON objects USING gin(tags);
+
+-- Multipart uploads table
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    upload_id VARCHAR(255) UNIQUE NOT NULL,
+    bucket_id UUID NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+    key VARCHAR(1024) NOT NULL,
+    status upload_status NOT NULL DEFAULT 'initiated',
+    
+    -- Object metadata (to be applied on completion)
+    content_type VARCHAR(255),
+    content_encoding VARCHAR(100),
+    content_language VARCHAR(100),
+    content_disposition VARCHAR(255),
+    cache_control VARCHAR(255),
+    expires TIMESTAMP WITH TIME ZONE,
+    user_metadata JSONB,
+    tags JSONB,
+    
+    -- Storage configuration
+    storage_class VARCHAR(50) NOT NULL DEFAULT 'STANDARD',
+    ec_data_shards INTEGER NOT NULL,
+    ec_parity_shards INTEGER NOT NULL,
+    
+    -- Encryption
+    encryption_type VARCHAR(50),
+    encryption_key_id VARCHAR(255),
+    encryption_context JSONB,
+    
+    -- Timestamps
+    initiated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMP WITH TIME ZONE,
+    aborted_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    
+    -- Owner information
+    owner_id VARCHAR(255) NOT NULL,
+    
+    CONSTRAINT valid_upload_key CHECK (key != '')
+);
+
+-- Indexes for multipart uploads
+CREATE INDEX idx_multipart_uploads_bucket_id ON multipart_uploads(bucket_id);
+CREATE INDEX idx_multipart_uploads_bucket_key ON multipart_uploads(bucket_id, key);
+CREATE INDEX idx_multipart_uploads_status ON multipart_uploads(status);
+CREATE INDEX idx_multipart_uploads_initiated_at ON multipart_uploads(initiated_at);
+CREATE INDEX idx_multipart_uploads_expires_at ON multipart_uploads(expires_at) WHERE status = 'initiated';
+
+-- Multipart upload parts table
+CREATE TABLE IF NOT EXISTS multipart_upload_parts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    upload_id UUID NOT NULL REFERENCES multipart_uploads(id) ON DELETE CASCADE,
+    part_number INTEGER NOT NULL,
+    
+    -- Part data
+    size BIGINT NOT NULL,
+    etag VARCHAR(255) NOT NULL,
+    md5_hash VARCHAR(32),
+    
+    -- Storage information
+    shard_locations JSONB NOT NULL,
+    
+    -- Timestamps
+    uploaded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    
+    CONSTRAINT valid_part_number CHECK (part_number > 0 AND part_number <= 10000),
+    CONSTRAINT valid_part_shard_locations CHECK (jsonb_typeof(shard_locations) = 'array'),
+    UNIQUE (upload_id, part_number)
+);
+
+-- Indexes for multipart upload parts
+CREATE INDEX idx_multipart_upload_parts_upload_id ON multipart_upload_parts(upload_id);
+CREATE INDEX idx_multipart_upload_parts_part_number ON multipart_upload_parts(upload_id, part_number);
+
+-- Access keys table
+CREATE TABLE IF NOT EXISTS access_keys (
+    id VARCHAR(255) PRIMARY KEY,
+    secret_hash VARCHAR(255) NOT NULL,
+    salt BYTEA NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    description TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
+    
+    -- Permissions
+    permissions JSONB,
+    
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    
+    CONSTRAINT valid_status CHECK (status IN ('active', 'inactive', 'expired'))
+);
+
+-- Indexes for access keys
+CREATE INDEX idx_access_keys_user_id ON access_keys(user_id);
+CREATE INDEX idx_access_keys_status ON access_keys(status);
+CREATE INDEX idx_access_keys_last_used_at ON access_keys(last_used_at);
+CREATE INDEX idx_access_keys_expires_at ON access_keys(expires_at);
+
+-- Audit log table
+CREATE TABLE IF NOT EXISTS audit_log (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    
+    -- Request information
+    request_id VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255),
+    access_key_id VARCHAR(255),
+    source_ip INET,
+    user_agent TEXT,
+    
+    -- Operation details
+    operation VARCHAR(100) NOT NULL,
+    bucket_name VARCHAR(255),
+    object_key VARCHAR(1024),
+    version_id VARCHAR(64),
+    
+    -- Request/response
+    request_method VARCHAR(10),
+    request_path TEXT,
+    request_query TEXT,
+    response_status INTEGER,
+    response_size BIGINT,
+    
+    -- Error information
+    error_code VARCHAR(100),
+    error_message TEXT,
+    
+    -- Additional context
+    context JSONB,
+    
+    -- Duration
+    duration_ms INTEGER
+);
+
+-- Indexes for audit log
+CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp DESC);
+CREATE INDEX idx_audit_log_user_id ON audit_log(user_id);
+CREATE INDEX idx_audit_log_access_key_id ON audit_log(access_key_id);
+CREATE INDEX idx_audit_log_bucket_name ON audit_log(bucket_name);
+CREATE INDEX idx_audit_log_operation ON audit_log(operation);
+CREATE INDEX idx_audit_log_source_ip ON audit_log(source_ip);
+CREATE INDEX idx_audit_log_context_gin ON audit_log USING gin(context);
+
+-- Partition audit log by month for better performance
+-- (This would be done programmatically in production)
+
+-- Replication queue table
+CREATE TABLE IF NOT EXISTS replication_queue (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    status replication_status NOT NULL DEFAULT 'pending',
+    
+    -- Source information
+    source_bucket VARCHAR(255) NOT NULL,
+    source_key VARCHAR(1024) NOT NULL,
+    source_version_id VARCHAR(64) NOT NULL,
+    
+    -- Destination information
+    destination_bucket VARCHAR(255) NOT NULL,
+    destination_region VARCHAR(50),
+    destination_prefix VARCHAR(1024),
+    
+    -- Replication details
+    priority INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    next_retry_at TIMESTAMP WITH TIME ZONE,
+    
+    -- Error information
+    last_error TEXT,
+    
+    CONSTRAINT valid_retry_count CHECK (retry_count <= max_retries)
+);
+
+-- Indexes for replication queue
+CREATE INDEX idx_replication_queue_status ON replication_queue(status);
+CREATE INDEX idx_replication_queue_priority ON replication_queue(priority DESC) WHERE status = 'pending';
+CREATE INDEX idx_replication_queue_next_retry ON replication_queue(next_retry_at) WHERE status = 'pending';
+CREATE INDEX idx_replication_queue_source ON replication_queue(source_bucket, source_key, source_version_id);
+
+-- Storage nodes table
+CREATE TABLE IF NOT EXISTS storage_nodes (
+    id VARCHAR(255) PRIMARY KEY,
+    host VARCHAR(255) NOT NULL,
+    port INTEGER NOT NULL,
+    grpc_port INTEGER NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
+    weight INTEGER NOT NULL DEFAULT 100,
+    
+    -- Capacity information
+    total_capacity_bytes BIGINT,
+    used_capacity_bytes BIGINT,
+    available_capacity_bytes BIGINT,
+    
+    -- Health information
+    last_heartbeat TIMESTAMP WITH TIME ZONE,
+    health_score FLOAT,
+    
+    -- Metadata
+    metadata JSONB,
+    
+    -- Timestamps
+    registered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    
+    CONSTRAINT valid_status CHECK (status IN ('active', 'inactive', 'drained', 'maintenance')),
+    CONSTRAINT valid_weight CHECK (weight >= 0 AND weight <= 1000)
+);
+
+-- Indexes for storage nodes
+CREATE INDEX idx_storage_nodes_status ON storage_nodes(status);
+CREATE INDEX idx_storage_nodes_last_heartbeat ON storage_nodes(last_heartbeat);
+
+-- Repair jobs table
+CREATE TABLE IF NOT EXISTS repair_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    
+    -- Object information
+    bucket_id UUID NOT NULL REFERENCES buckets(id),
+    object_id UUID NOT NULL REFERENCES objects(id),
+    shard_index INTEGER NOT NULL,
+    
+    -- Repair details
+    missing_node VARCHAR(255) NOT NULL,
+    target_node VARCHAR(255),
+    
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    
+    -- Error information
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    
+    CONSTRAINT valid_repair_status CHECK (status IN ('pending', 'in_progress', 'completed', 'failed'))
+);
+
+-- Indexes for repair jobs
+CREATE INDEX idx_repair_jobs_status ON repair_jobs(status);
+CREATE INDEX idx_repair_jobs_created_at ON repair_jobs(created_at);
+CREATE INDEX idx_repair_jobs_object_id ON repair_jobs(object_id);
+
+-- Functions and triggers
+
+-- Update timestamps trigger function
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Apply update timestamp trigger to tables
+CREATE TRIGGER update_buckets_updated_at BEFORE UPDATE ON buckets
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_objects_updated_at BEFORE UPDATE ON objects
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_access_keys_updated_at BEFORE UPDATE ON access_keys
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_storage_nodes_updated_at BEFORE UPDATE ON storage_nodes
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Update bucket statistics function
+CREATE OR REPLACE FUNCTION update_bucket_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE buckets
+        SET object_count = object_count + 1,
+            total_size = total_size + NEW.size
+        WHERE id = NEW.bucket_id;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'active' AND NEW.status = 'deleted' THEN
+            UPDATE buckets
+            SET object_count = object_count - 1,
+                total_size = total_size - OLD.size
+            WHERE id = OLD.bucket_id;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE buckets
+        SET object_count = object_count - 1,
+            total_size = total_size - OLD.size
+        WHERE id = OLD.bucket_id;
+    END IF;
+    RETURN NULL;
+END;
+$$ language 'plpgsql';
+
+-- Apply bucket stats trigger
+CREATE TRIGGER update_bucket_stats_trigger
+AFTER INSERT OR UPDATE OR DELETE ON objects
+    FOR EACH ROW EXECUTE FUNCTION update_bucket_stats();
+
+-- Create materialized view for bucket statistics
+CREATE MATERIALIZED VIEW IF NOT EXISTS bucket_statistics AS
+SELECT
+    b.id,
+    b.name,
+    b.owner_id,
+    COUNT(o.id) as object_count,
+    COALESCE(SUM(o.size), 0) as total_size,
+    COUNT(o.id) FILTER (WHERE o.is_latest = TRUE) as latest_version_count,
+    MAX(o.last_modified) as last_modified
+FROM buckets b
+LEFT JOIN objects o ON o.bucket_id = b.id AND o.status = 'active'
+GROUP BY b.id, b.name, b.owner_id;
+
+CREATE UNIQUE INDEX idx_bucket_statistics_id ON bucket_statistics(id);
+CREATE INDEX idx_bucket_statistics_owner ON bucket_statistics(owner_id);
+
+-- View for active objects
+CREATE OR REPLACE VIEW active_objects AS
+SELECT * FROM objects WHERE status = 'active' AND is_latest = TRUE;
+
+-- View for pending multipart uploads
+CREATE OR REPLACE VIEW pending_multipart_uploads AS
+SELECT
+    mu.*,
+    COUNT(mup.id) as parts_count,
+    COALESCE(SUM(mup.size), 0) as uploaded_size
+FROM multipart_uploads mu
+LEFT JOIN multipart_upload_parts mup ON mup.upload_id = mu.id
+WHERE mu.status = 'initiated'
+GROUP BY mu.id;
+```
+
+## File: pkg/meta/sqlc.yaml
+
+```yaml
+# path: pkg/meta/sqlc.yaml
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "queries.sql"
+    schema: "schema.sql"
+    gen:
+      go:
+        package: "metadb"
+        out: "metadb"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_interface: true
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        query_parameter_limit: 10
+```
+
+## File: pkg/meta/queries.sql
+
+```sql
+-- path: pkg/meta/queries.sql
+
+-- name: CreateBucket :one
+INSERT INTO buckets (
+    name, owner_id, region, versioning_status, policy, cors_config,
+    lifecycle_config, encryption_config, tags
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
+) RETURNING *;
+
+-- name: GetBucket :one
+SELECT * FROM buckets WHERE name = $1 AND status = 'active';
+
+-- name: GetBucketByID :one
+SELECT * FROM buckets WHERE id = $1;
+
+-- name: ListBuckets :many
+SELECT * FROM buckets WHERE owner_id = $1 AND status = 'active'
+ORDER BY created_at DESC
+LIMIT $2 OFFSET $3;
+
+-- name: UpdateBucket :one
+UPDATE buckets SET
+    versioning_status = COALESCE(sqlc.narg('versioning_status'), versioning_status),
+    policy = COALESCE(sqlc.narg('policy'), policy),
+    cors_config = COALESCE(sqlc.narg('cors_config'), cors_config),
+    lifecycle_config = COALESCE(sqlc.narg('lifecycle_config'), lifecycle_config),
+    encryption_config = COALESCE(sqlc.narg('encryption_config'), encryption_config),
+    tags = COALESCE(sqlc.narg('tags'), tags)
+WHERE id = sqlc.arg('id')
+RETURNING *;
+
+-- name: DeleteBucket :exec
+UPDATE buckets SET status = 'deleted', deleted_at = NOW()
+WHERE id = $1;
+
+-- name: CreateObject :one
+INSERT INTO objects (
+    bucket_id, key, version_id, status, is_latest, is_delete_marker,
+    size, content_type, content_encoding, content_language,
+    content_disposition, cache_control, expires, etag,
+    user_metadata, system_metadata, storage_class,
+    ec_data_shards, ec_parity_shards, shard_locations,
+    encryption_type, encryption_key_id, encryption_context,
+    md5_hash, sha256_hash, tags
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $21, $22, $23, $24, $25, $26
+) RETURNING *;
+
+-- name: GetObject :one
+SELECT * FROM objects
+WHERE bucket_id = $1 AND key = $2 AND version_id = $3 AND status = 'active';
+
+-- name: GetLatestObject :one
+SELECT * FROM objects
+WHERE bucket_id = $1 AND key = $2 AND is_latest = TRUE AND status = 'active'
+LIMIT 1;
+
+-- name: ListObjects :many
+SELECT * FROM objects
+WHERE bucket_id = $1 AND status = 'active' AND is_latest = TRUE
+    AND ($2::text IS NULL OR key > $2)
+ORDER BY key
+LIMIT $3;
+
+-- name: ListObjectsWithPrefix :many
+SELECT * FROM objects
+WHERE bucket_id = $1 AND status = 'active' AND is_latest = TRUE
+    AND key LIKE $2 || '%'
+    AND ($3::text IS NULL OR key > $3)
+ORDER BY key
+LIMIT $4;
+
+-- name: ListObjectVersions :many
+SELECT * FROM objects
+WHERE bucket_id = $1 AND key = $2 AND status = 'active'
+ORDER BY created_at DESC;
+
+-- name: MarkObjectDeleted :one
+UPDATE objects SET status = 'deleted', deleted_at = NOW()
+WHERE bucket_id = $1 AND key = $2 AND version_id = $3
+RETURNING *;
+
+-- name: UnmarkLatestVersion :exec
+UPDATE objects SET is_latest = FALSE
+WHERE bucket_id = $1 AND key = $2 AND is_latest = TRUE;
+
+-- name: InitiateMultipartUpload :one
+INSERT INTO multipart_uploads (
+    upload_id, bucket_id, key, content_type, content_encoding,
+    content_language, content_disposition, cache_control, expires,
+    user_metadata, tags, storage_class, ec_data_shards, ec_parity_shards,
+    encryption_type, encryption_key_id, encryption_context,
+    expires_at, owner_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18, $19
+) RETURNING *;
+
+-- name: GetMultipartUpload :one
+SELECT * FROM multipart_uploads WHERE upload_id = $1;
+
+-- name: ListMultipartUploads :many
+SELECT * FROM multipart_uploads
+WHERE bucket_id = $1 AND status = 'initiated'
+ORDER BY initiated_at DESC
+LIMIT $2 OFFSET $3;
+
+-- name: CompleteMultipartUpload :one
+UPDATE multipart_uploads
+SET status = 'completed', completed_at = NOW()
+WHERE upload_id = $1
+RETURNING *;
+
+-- name: AbortMultipartUpload :one
+UPDATE multipart_uploads
+SET status = 'aborted', aborted_at = NOW()
+WHERE upload_id = $1
+RETURNING *;
+
+-- name: AddMultipartUploadPart :one
+INSERT INTO multipart_upload_parts (
+    upload_id, part_number, size, etag, md5_hash, shard_locations
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+) RETURNING *;
+
+-- name: GetMultipartUploadPart :one
+SELECT * FROM multipart_upload_parts
+WHERE upload_id = $1 AND part_number = $2;
+
+-- name: ListMultipartUploadParts :many
+SELECT * FROM multipart_upload_parts
+WHERE upload_id = $1
+ORDER BY part_number;
+
+-- name: DeleteMultipartUploadParts :exec
+DELETE FROM multipart_upload_parts WHERE upload_id = $1;
+
+-- name: CreateAccessKey :one
+INSERT INTO access_keys (
+    id, secret_hash, salt, user_id, description, status, permissions, expires_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8
+) RETURNING *;
+
+-- name: GetAccessKey :one
+SELECT * FROM access_keys WHERE id = $1;
+
+-- name: ListAccessKeysByUser :many
+SELECT * FROM access_keys WHERE user_id = $1 ORDER BY created_at DESC;
+
+-- name: UpdateAccessKeyStatus :one
+UPDATE access_keys SET status = $2 WHERE id = $1 RETURNING *;
+
+-- name: UpdateAccessKeyLastUsed :exec
+UPDATE access_keys SET last_used_at = $2 WHERE id = $1;
+
+-- name: DeleteAccessKey :exec
+DELETE FROM access_keys WHERE id = $1;
+
+-- name: CreateAuditLogEntry :one
+INSERT INTO audit_log (
+    request_id, user_id, access_key_id, source_ip, user_agent,
+    operation, bucket_name, object_key, version_id,
+    request_method, request_path, request_query,
+    response_status, response_size, error_code, error_message,
+    context, duration_ms
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18
+) RETURNING *;
+
+-- name: GetAuditLogs :many
+SELECT * FROM audit_log
+WHERE ($1::timestamp IS NULL OR timestamp >= $1)
+    AND ($2::timestamp IS NULL OR timestamp <= $2)
+    AND ($3::text IS NULL OR user_id = $3)
+    AND ($4::text IS NULL OR bucket_name = $4)
+ORDER BY timestamp DESC
+LIMIT $5 OFFSET $6;
+
+-- name: CreateReplicationTask :one
+INSERT INTO replication_queue (
+    source_bucket, source_key, source_version_id,
+    destination_bucket, destination_region, destination_prefix,
+    priority
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7
+) RETURNING *;
+
+-- name: GetPendingReplicationTasks :many
+SELECT * FROM replication_queue
+WHERE status = 'pending'
+    AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+ORDER BY priority DESC, created_at
+LIMIT $1;
+
+-- name: UpdateReplicationTaskStatus :one
+UPDATE replication_queue
+SET status = $2,
+    started_at = CASE WHEN $2 = 'in_progress' THEN NOW() ELSE started_at END,
+    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE completed_at END
+WHERE id = $1
+RETURNING *;
+
+-- name: FailReplicationTask :one
+UPDATE replication_queue
+SET status = CASE WHEN retry_count >= max_retries THEN 'failed'::replication_status ELSE 'pending'::replication_status END,
+    retry_count = retry_count + 1,
+    next_retry_at = NOW() + (POWER(2, retry_count) || ' minutes')::INTERVAL,
+    last_error = $2
+WHERE id = $1
+RETURNING *;
+
+-- name: RegisterStorageNode :one
+INSERT INTO storage_nodes (
+    id, host, port, grpc_port, weight, total_capacity_bytes, metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7
+) ON CONFLICT (id) DO UPDATE
+SET host = EXCLUDED.host,
+    port = EXCLUDED.port,
+    grpc_port = EXCLUDED.grpc_port,
+    weight = EXCLUDED.weight,
+    last_heartbeat = NOW()
+RETURNING *;
+
+-- name: UpdateStorageNodeHeartbeat :exec
+UPDATE storage_nodes
+SET last_heartbeat = NOW(),
+    used_capacity_bytes = $2,
+    available_capacity_bytes = $3,
+    health_score = $4
+WHERE id = $1;
+
+-- name: UpdateStorageNodeStatus :one
+UPDATE storage_nodes SET status = $2 WHERE id = $1 RETURNING *;
+
+-- name: GetStorageNode :one
+SELECT * FROM storage_nodes WHERE id = $1;
+
+-- name: ListStorageNodes :many
+SELECT * FROM storage_nodes ORDER BY id;
+
+-- name: ListActiveStorageNodes :many
+SELECT * FROM storage_nodes WHERE status = 'active' ORDER BY id;
+
+-- name: CreateRepairJob :one
+INSERT INTO repair_jobs (
+    bucket_id, object_id, shard_index, missing_node, target_node
+) VALUES (
+    $1, $2, $3, $4, $5
+) RETURNING *;
+
+-- name: GetPendingRepairJobs :many
+SELECT * FROM repair_jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT $1;
+
+-- name: UpdateRepairJobStatus :one
+UPDATE repair_jobs
+SET status = $2,
+    started_at = CASE WHEN $2 = 'in_progress' THEN NOW() ELSE started_at END,
+    completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN NOW() ELSE completed_at END
+WHERE id = $1
+RETURNING *;
+
+-- name: FailRepairJob :one
+UPDATE repair_jobs
+SET retry_count = retry_count + 1,
+    last_error = $2,
+    status = CASE WHEN retry_count >= 3 THEN 'failed' ELSE 'pending' END
+WHERE id = $1
+RETURNING *;
+```
+
